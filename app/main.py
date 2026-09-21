@@ -6,8 +6,13 @@ from typing import List
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from .geofence import assign_zones, build_zone, summarize_zones
 from .hotspot import find_hotspots
 from .models import (
+    GeofenceStay,
+    GeofenceVisitRequest,
+    GeofenceVisitResponse,
+    GeofenceZoneSummary,
     Hotspot,
     HotspotRequest,
     HotspotResponse,
@@ -21,11 +26,12 @@ from .staypoint import Point, StaySegment, detect_stays, total_distance_m
 
 app = FastAPI(
     title="轨迹停留分析 API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "提交带时间戳的有序轨迹，按 Haversine 距离与最短停留时长阈值流式合并连续点，"
         "识别停留区段（含跨采样间断切分），返回停留时长、中心点、原始点范围，"
-        "并提供 GeoJSON 结果、总里程统计，以及基于停留中心连通分量的跨时段热点归并。"
+        "并提供 GeoJSON 结果、总里程统计，基于停留中心连通分量的跨时段热点归并，"
+        "以及停留中心对 Polygon/MultiPolygon 围栏（含洞与跨 180° 经线）的访问归属汇总。"
     ),
 )
 
@@ -126,6 +132,45 @@ def _analyze_hotspots(req: HotspotRequest) -> HotspotResponse:
     )
 
 
+def _analyze_geofence_visits(req: GeofenceVisitRequest) -> GeofenceVisitResponse:
+    points = _to_points(req)
+    segments = _detect_segments(req)
+
+    zones = [
+        build_zone(
+            zone_id=g.zone_id,
+            priority=g.priority,
+            geometry_type=g.geometry.type,
+            coordinates=g.geometry.coordinates,
+        )
+        for g in req.geofences
+    ]
+    assignment = assign_zones(segments, zones)
+
+    stays = [
+        GeofenceStay(
+            stay_id=i + 1,
+            center_lat=seg.center_lat,
+            center_lon=seg.center_lon,
+            start_time=seg.start_time,
+            end_time=seg.end_time,
+            duration_s=seg.duration_s,
+            start_index=seg.start_index,
+            end_index=seg.end_index,
+            point_count=seg.point_count,
+            zone_id=assignment[i],
+        )
+        for i, seg in enumerate(segments)
+    ]
+    zone_summaries = [
+        GeofenceZoneSummary(zone_id=zone_id, visit_count=count, total_duration_s=duration)
+        for zone_id, count, duration in summarize_zones(zones, segments, assignment)
+    ]
+    return GeofenceVisitResponse(
+        stays=stays, zones=zone_summaries, stats=_build_stats(points, stays)
+    )
+
+
 @app.get("/health", summary="健康检查")
 def health() -> dict:
     return {"status": "ok"}
@@ -147,6 +192,15 @@ def analyze_stays(req: StayRequest) -> StayResponse:
 )
 def analyze_hotspots(req: HotspotRequest) -> HotspotResponse:
     return _analyze_hotspots(req)
+
+
+@app.post(
+    "/api/v1/geofence-visits",
+    response_model=GeofenceVisitResponse,
+    summary="围栏访问归属（停留中心点面判定）",
+)
+def analyze_geofence_visits(req: GeofenceVisitRequest) -> GeofenceVisitResponse:
+    return _analyze_geofence_visits(req)
 
 
 @app.post(
