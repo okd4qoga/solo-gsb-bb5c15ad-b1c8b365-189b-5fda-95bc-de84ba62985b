@@ -4,20 +4,31 @@
 以及距离阈值、最短停留时长阈值；服务按 **Haversine** 距离和时间间隔**流式合并**连续点，
 识别停留区段的**进入 / 离开**时间与**跨采样间断**，返回每个停留的**时长、中心点、原始点下标范围**，
 并附带 **GeoJSON** 结果与**总里程、停留次数**等统计。`/api/v1/hotspots` 进一步在停留结果之上
-以**中心连通分量**归并跨时段重复到访，输出热点（含传递扩展、稳定编号、时长加权中心）与噪声标记。
+以**中心连通分量**归并跨时段重复到访，输出热点（含传递扩展、稳定编号、时长加权中心）与噪声标记；
+`/api/v1/geofence-visits` 则以停留**中心点**对带洞、可跨 180° 经线的 GeoJSON 围栏做点面归属，
+返回每段停留的 `zone_id`（未命中为 `null`）及按围栏汇总的访问次数与累计停留时长。
 
 ## 功能特性
 
 - 流式停留检测：逐点扫描合并，经典 stay-point 算法（锚点距离判定），时间复杂度 O(n)
 - 跨采样间断处理：相邻点间隔超过 `max_gap_s` 强制切分段落，间断时间不计入停留时长
-- 每个停留返回：进入 / 离开时间、停留时长、中心点（簇内均值）、原始点下标闭区间、点数
+- 每个停留返回：进入 / 离开时间、停留时长、中心点（簇内均值；跨 180° 经线的簇用圆均值）、原始点下标闭区间、点数
 - 整体统计：总里程（Haversine 累计）、轨迹总时长、停留次数、停留总时长
 - GeoJSON 输出：轨迹 LineString + 停留点 Point 的 FeatureCollection，可直接上图（GeoJSON.io / Kepler 等）
 - **跨时段热点归并**：停留中心间距离 ≤ 半径连无向边，并查集求连通分量；支持“甲邻乙、乙邻丙、
   甲不邻丙”的传递扩展，结果不随遍历顺序改变；热点按最早访问时间稳定编号，中心按停留时长加权
+- **围栏访问统计**：GeoJSON Polygon / MultiPolygon 点面归属；外环边界视为命中，洞内及洞边界视为
+  未命中；多边形可跨越 180° 经线（无需预切割）；多围栏同时命中按 `priority` 降序、`zone_id`
+  字典序唯一决胜；汇总保留零访问围栏
 - 时间戳兼容 ISO 8601 字符串与 Unix 秒（epoch）；参数校验失败返回 422
 
 ## 快速开始
+
+一条命令启动（Docker Compose，自动构建并在前台运行，监听 **8000** 端口）：
+
+```bash
+docker compose up --build
+```
 
 ### 方式一：Docker Compose（一键启动）
 
@@ -210,7 +221,81 @@ H/M/F 靠**传递**归为热点 1（4 次访问），W 为热点 2（2 次访问
 | `hotspots[].stay_ids` | 成员停留的 `stay_id`（升序） |
 | `stats` | 与 `/api/v1/stays` 相同的整体统计 |
 
-### 3. `POST /api/v1/stays/geojson` — GeoJSON 结果
+### 3. `POST /api/v1/geofence-visits` — 围栏访问统计（点面归属）
+
+**请求体**：完整沿用 `POST /api/v1/stays` 的全部字段（`points`、`distance_threshold_m`、
+`min_stay_duration_s`、`max_gap_s`），并额外要求 `geofences` 围栏列表：
+
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| `geofences` | array | 是 | — | 围栏列表，允许空数组 `[]`；列表内 `zone_id` 必须唯一 |
+| `geofences[].zone_id` | string | 是 | — | 围栏唯一编号（非空） |
+| `geofences[].priority` | int | 否 | `0` | 优先级：多围栏同时命中时取**较大值**，持平再按 `zone_id` 字典序决胜 |
+| `geofences[].geometry` | object | 是 | — | GeoJSON `Polygon` 或 `MultiPolygon`，坐标顺序 `[lon, lat]` |
+
+服务**先按既有算法识别停留**（完全复用，响应字段与 `/api/v1/stays` 一致），再以每段停留的
+**中心点**做点面归属：
+
+- **外环边界视为命中**：中心点压在外环的边或顶点上算面内；
+- **洞内及洞边界视为未命中**：落入孔洞内部或孔洞边界都算面外；
+- **跨 180° 经线**：多边形按 GeoJSON 惯例在 ±180° 附近折返编码即可
+  （如 `[..., 179.95, ..., -179.95, ...]`），服务内部自动经度连续化，无需预切割；
+- 多个围栏同时命中时按 **`priority` 降序 → `zone_id` 字典序升序** 唯一决胜，
+  归属结果与围栏输入顺序无关；未命中任何围栏的停留 `zone_id` 为 `null`；
+- 响应 `geofences` **按请求中的围栏顺序**逐一汇总访问次数与累计停留时长，
+  零访问围栏也保留（计数为 0、时长为 0）。
+
+> 几何校验：环必须闭合（首末坐标相同）且至少 4 个点；经度 `[-180, 180]`、纬度 `[-90, 90]`；
+> 单条环的经度跨度不超过 180°。不合法时返回 422。
+
+**请求示例**
+
+```bash
+curl -X POST http://localhost:8000/api/v1/geofence-visits \
+  -H 'Content-Type: application/json' \
+  -d @examples/geofence_request.json
+```
+
+`examples/geofence_request.json` 描述的场景：一天内 4 次停留——家 2 次、公司 1 次、咖啡馆
+1 次；围栏包括家 / 公司（priority 5）、咖啡馆与一个覆盖全城的低优先级重叠框（priority 1）、
+从未到访的公园，以及一个跨 180° 经线的 MultiPolygon 围栏。重叠框虽然罩住全部停留，但优先级
+低于各小围栏，因此一次也不会胜出。
+
+**响应示例**（实际输出，节选）
+
+```json
+{
+  "stays": [
+    {"stay_id": 1, "zone_id": "zone-home", "center_lat": 39.9, "...": "..."},
+    {"stay_id": 2, "zone_id": "zone-work", "center_lat": 39.99, "...": "..."},
+    {"stay_id": 3, "zone_id": "zone-cafe", "center_lat": 39.95, "...": "..."},
+    {"stay_id": 4, "zone_id": "zone-home", "center_lat": 39.9, "...": "..."}
+  ],
+  "geofences": [
+    {"zone_id": "zone-home", "priority": 5, "visit_count": 2, "total_duration_s": 360.0, "stay_ids": [1, 4]},
+    {"zone_id": "zone-work", "priority": 5, "visit_count": 1, "total_duration_s": 180.0, "stay_ids": [2]},
+    {"zone_id": "zone-cafe", "priority": 1, "visit_count": 1, "total_duration_s": 180.0, "stay_ids": [3]},
+    {"zone_id": "zone-overlap", "priority": 1, "visit_count": 0, "total_duration_s": 0.0, "stay_ids": []},
+    {"zone_id": "zone-park", "priority": 0, "visit_count": 0, "total_duration_s": 0.0, "stay_ids": []},
+    {"zone_id": "zone-dateline", "priority": 0, "visit_count": 0, "total_duration_s": 0.0, "stay_ids": []}
+  ],
+  "stats": { "point_count": 16, "stay_count": 4, "total_stay_duration_s": 720.0, "...": "..." }
+}
+```
+
+**响应字段**
+
+| 字段 | 说明 |
+| --- | --- |
+| `stays[]` | 停留字段与 `/api/v1/stays` 完全一致，另附围栏归属 |
+| `stays[].zone_id` | 命中的围栏 `zone_id`；未命中任何围栏为 `null` |
+| `geofences[].zone_id / priority` | 围栏编号与优先级，顺序与请求一致 |
+| `geofences[].visit_count` | 访问次数：中心点命中该围栏的停留段数 |
+| `geofences[].total_duration_s` | 命中停留的累计停留时长（秒） |
+| `geofences[].stay_ids` | 命中该围栏的停留 `stay_id`（升序） |
+| `stats` | 与 `/api/v1/stays` 相同的整体统计 |
+
+### 4. `POST /api/v1/stays/geojson` — GeoJSON 结果
 
 请求体与上相同。返回 `application/geo+json` 的 `FeatureCollection`：
 
@@ -223,7 +308,7 @@ curl -X POST http://localhost:8000/api/v1/stays/geojson \
   -d @examples/request.json | jq .
 ```
 
-### 4. `GET /health` — 健康检查
+### 5. `GET /health` — 健康检查
 
 ```json
 {"status": "ok"}
@@ -257,6 +342,21 @@ curl -X POST http://localhost:8000/api/v1/stays/geojson \
 5. 热点中心 = 成员停留中心以各自 `duration_s` 为权重的加权平均（权重总和为 0 时取等权均值）；
    `total_duration_s` 为成员停留时长之和，`visit_count` 为成员停留段数。
 
+### 围栏点面归属（`app/geofence.py`）
+
+在停留区段结果之上，以每段停留的**中心点**做归属（算法实现见 `app/geofence.py`，无第三方几何依赖）：
+
+1. **经度连续化**：对每条线性环沿顶点顺序推进，相邻顶点经度差超过 ±180° 时整体平移 360°，
+   跨越 180° 经线的环在展开坐标中成为普通多边形；孔洞环若以另一经度参考系编码，
+   会整体平移到外环参考系；查询点分别以 `lon`、`lon±360` 三个经度像参与判定；
+2. **射线法点面判定**：水平射线穿越边数的奇偶判内 / 外；点压在线段（含端点）上单独识别为
+   “边界”——外环边界计为命中，孔洞边界与洞内一律计为未命中（浮点容差约 1e-9 度）；
+3. MultiPolygon 的每个多边形可使用各自的经度参考系，任一部分命中即算该围栏命中；
+4. **唯一决胜**：围栏按 `(-priority, zone_id)` 排序后依次判定，首个命中者唯一归属，
+   因此结果只与围栏属性有关、与输入顺序无关；未命中为 `null`；
+5. 汇总按请求中围栏顺序输出 `visit_count`（命中停留段数）与 `total_duration_s`
+   （命中停留时长之和），零访问围栏保留 0 值。
+
 > 注意：输入轨迹须按时间升序排列；`start_index` / `end_index` 对应请求数组中的原始下标。
 
 ## 项目结构
@@ -264,18 +364,22 @@ curl -X POST http://localhost:8000/api/v1/stays/geojson \
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 应用与路由（/stays、/hotspots、/stays/geojson）
-│   ├── models.py        # Pydantic 请求 / 响应模型
+│   ├── main.py          # FastAPI 应用与路由（/stays、/hotspots、/geofence-visits、/stays/geojson）
+│   ├── models.py        # Pydantic 请求 / 响应模型（含 GeoJSON Polygon/MultiPolygon 校验）
 │   ├── staypoint.py     # Haversine 与停留检测核心算法（纯函数）
-│   └── hotspot.py       # 热点归并：连通分量（并查集）+ 时长加权中心（纯函数）
+│   ├── hotspot.py       # 热点归并：连通分量（并查集）+ 时长加权中心（纯函数）
+│   └── geofence.py      # 围栏点面归属：射线法 + 孔洞 + 跨 180° 经线连续化（纯函数）
 ├── tests/
 │   ├── test_api.py          # /stays 接口集成测试（TestClient）
 │   ├── test_staypoint.py    # 停留检测算法单元测试
 │   ├── test_hotspot.py      # 热点归并算法单元测试（传递扩展、顺序无关、稳定编号）
-│   └── test_hotspot_api.py  # /hotspots 接口集成测试
+│   ├── test_hotspot_api.py  # /hotspots 接口集成测试
+│   ├── test_geofence.py     # 围栏归属算法单元测试（边界、孔洞、跨经线、决胜、汇总）
+│   └── test_geofence_api.py # /geofence-visits 接口集成测试
 ├── examples/
 │   ├── request.json         # /stays 示例请求体
-│   └── hotspot_request.json # /hotspots 示例请求体
+│   ├── hotspot_request.json # /hotspots 示例请求体
+│   └── geofence_request.json # /geofence-visits 示例请求体
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt       # 运行依赖
@@ -289,7 +393,9 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-共 25 个用例，覆盖 Haversine 距离、停留合并、最短时长过滤、采样间断切分、
-GeoJSON 结构、参数校验（422），以及热点的链式传递扩展、多分量与噪声标记、
+共 43 个用例，覆盖 Haversine 距离、停留合并、最短时长过滤、采样间断切分、跨 180° 经线簇中心、
+GeoJSON 结构、参数校验（422），热点的链式传递扩展、多分量与噪声标记、
 `min_visits` 过滤、半径边界（含等号）、时长加权中心、最早访问时间稳定编号、
-打乱 / 颠倒输入顺序后的结果确定性等。
+打乱 / 颠倒输入顺序后的结果确定性，以及围栏的外环边界命中、洞内 / 洞边界未命中、
+跨 180° 经线多边形（含反向编码与 MultiPolygon）、孔洞参考系对齐、
+priority + zone_id 决胜（与输入顺序无关）、零访问围栏保留等。

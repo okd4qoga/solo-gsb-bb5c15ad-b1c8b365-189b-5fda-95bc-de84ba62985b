@@ -94,3 +94,39 @@ def test_total_distance():
     # 主要是 A->B 约 1113m 的跳变，加上簇内小抖动
     assert 1100.0 < d < 1200.0
     assert total_distance_m(SCENARIO[:1]) == 0.0
+
+
+def test_center_wraps_across_antimeridian():
+    # 簇内点在 180° 经线两侧跳号（物理上仍是同一停留）：
+    # 朴素经度均值 ~90E 完全错位，圆均值应落在 180°
+    points = make_points(
+        [
+            (0.5, 179.99, 0),
+            (0.5, 180.0, 60),
+            (0.5, -179.99, 120),
+            (0.5, 180.0, 180),
+        ]
+    )
+    stays = detect_stays(
+        points,
+        distance_threshold_m=3000.0,
+        min_stay_duration_s=60.0,
+    )
+    assert len(stays) == 1
+    assert stays[0].center_lat == pytest.approx(0.5)
+    assert stays[0].center_lon == pytest.approx(180.0, abs=1e-9)
+
+    # 不跨经线的簇仍为朴素算术均值（行为保持不变）
+    normal = make_points(
+        [
+            (39.9, 116.40000, 0),
+            (39.9, 116.40001, 60),
+            (39.9, 116.39999, 120),
+            (39.9, 116.40000, 180),
+        ]
+    )
+    stays = detect_stays(
+        normal, distance_threshold_m=100.0, min_stay_duration_s=60.0
+    )
+    assert len(stays) == 1
+    assert stays[0].center_lon == pytest.approx(116.4, abs=1e-9)

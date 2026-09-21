@@ -80,8 +80,17 @@ def detect_stays(
         if (end_ts - start_ts).total_seconds() < min_stay_duration_s:
             return
         count = end_idx - start_idx + 1
-        center_lat = sum(points[i][0] for i in range(start_idx, end_idx + 1)) / count
-        center_lon = sum(points[i][1] for i in range(start_idx, end_idx + 1)) / count
+        lats = [points[i][0] for i in range(start_idx, end_idx + 1)]
+        lons = [points[i][1] for i in range(start_idx, end_idx + 1)]
+        center_lat = sum(lats) / count
+        if max(lons) - min(lons) > 180.0:
+            # 簇内经度跨越 180° 经线（如 179.999 与 -179.999 同属一个停留）：
+            # 用 sin/cos 圆均值，避免朴素均值得到远离实际位置的 ~0°
+            sin_sum = sum(math.sin(math.radians(lon)) for lon in lons)
+            cos_sum = sum(math.cos(math.radians(lon)) for lon in lons)
+            center_lon = math.degrees(math.atan2(sin_sum, cos_sum))
+        else:
+            center_lon = sum(lons) / count
         stays.append(
             StaySegment(
                 start_index=start_idx,

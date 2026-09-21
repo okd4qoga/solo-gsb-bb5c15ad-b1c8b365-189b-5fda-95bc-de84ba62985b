@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class TrackPoint(BaseModel):
@@ -131,4 +131,124 @@ class HotspotResponse(BaseModel):
 
 class StayResponse(BaseModel):
     stays: List[Stay]
+    stats: Stats
+
+
+# --- 围栏访问（POST /api/v1/geofence-visits） ---
+
+
+class GeoJSONGeometry(BaseModel):
+    """GeoJSON Polygon / MultiPolygon 几何（坐标顺序 [lon, lat]）。
+
+    跨 180° 经线的多边形按 GeoJSON 惯例在 ±180° 附近折返编码即可
+    （如 [..., 179.9, ..., -179.9, ...]），服务内部自动连续化处理，
+    无需调用方预先切割；单条环的经度跨度不得超过 180°。
+    """
+
+    type: Literal["Polygon", "MultiPolygon"]
+    coordinates: List[Any] = Field(..., description="GeoJSON 坐标：Polygon 为环数组，MultiPolygon 为多边形数组")
+
+    @field_validator("coordinates")
+    @classmethod
+    def _validate_coordinates(cls, v, info):
+        geom_type = info.data.get("type")
+        if geom_type is None:
+            return v
+
+        def reject(msg: str):
+            raise ValueError(msg)
+
+        def check_position(pos) -> None:
+            if (
+                not isinstance(pos, (list, tuple))
+                or len(pos) < 2
+                or isinstance(pos[0], bool)
+                or isinstance(pos[1], bool)
+            ):
+                reject("坐标点必须是至少包含 [lon, lat] 两个数值的数组")
+            lon, lat = pos[0], pos[1]
+            if not isinstance(lon, (int, float)) or not isinstance(lat, (int, float)):
+                reject("坐标点的经纬度必须为数值")
+            if not -180.0 <= float(lon) <= 180.0:
+                reject("经度必须在 [-180, 180] 范围内")
+            if not -90.0 <= float(lat) <= 90.0:
+                reject("纬度必须在 [-90, 90] 范围内")
+
+        def check_ring(ring) -> None:
+            if not isinstance(ring, list) or len(ring) < 4:
+                reject("线性环至少需要 4 个坐标点（首尾相同）")
+            for pos in ring:
+                check_position(pos)
+            if list(ring[0])[:2] != list(ring[-1])[:2]:
+                reject("线性环必须闭合：首末坐标点需相同（未闭合时请手动补齐）")
+
+        def check_polygon(polygon) -> None:
+            if not isinstance(polygon, list) or len(polygon) < 1:
+                reject("Polygon 必须至少包含一个外环")
+            for ring in polygon:
+                check_ring(ring)
+
+        if geom_type == "Polygon":
+            check_polygon(v)
+        else:
+            if not isinstance(v, list):
+                reject("MultiPolygon 的 coordinates 必须是数组")
+            for polygon in v:
+                check_polygon(polygon)
+        return v
+
+
+class Geofence(BaseModel):
+    """一个电子围栏：编号、优先级与 Polygon / MultiPolygon 几何。"""
+
+    zone_id: str = Field(..., min_length=1, description="围栏唯一编号")
+    priority: int = Field(
+        0,
+        description="优先级：多围栏同时命中时取较大值，持平再按 zone_id 字典序决胜",
+    )
+    geometry: GeoJSONGeometry = Field(
+        ..., description="GeoJSON Polygon 或 MultiPolygon（[lon, lat] 坐标）"
+    )
+
+
+class GeofenceVisitRequest(StayRequest):
+    """围栏访问请求：沿用停留检测参数，追加围栏列表。"""
+
+    geofences: List[Geofence] = Field(
+        ..., description="围栏列表（zone_id 须唯一），可为空数组"
+    )
+
+    @model_validator(mode="after")
+    def _check_unique_zone_ids(self):
+        seen = set()
+        for fence in self.geofences:
+            if fence.zone_id in seen:
+                raise ValueError(f"zone_id 重复：{fence.zone_id}")
+            seen.add(fence.zone_id)
+        return self
+
+
+class GeofenceStay(Stay):
+    """带围栏归属的停留区段。"""
+
+    zone_id: Optional[str] = Field(
+        ..., description="命中的围栏编号；未命中任何围栏为 null"
+    )
+
+
+class GeofenceSummary(BaseModel):
+    """单个围栏的访问汇总（按请求中围栏顺序输出，零访问也保留）。"""
+
+    zone_id: str = Field(..., description="围栏编号")
+    priority: int = Field(..., description="围栏优先级")
+    visit_count: int = Field(..., description="访问次数（中心点命中该围栏的停留段数）")
+    total_duration_s: float = Field(..., description="命中停留的累计时长（秒）")
+    stay_ids: List[int] = Field(
+        ..., description="命中该围栏的停留 stay_id（按停留编号升序）"
+    )
+
+
+class GeofenceVisitResponse(BaseModel):
+    stays: List[GeofenceStay]
+    geofences: List[GeofenceSummary]
     stats: Stats
